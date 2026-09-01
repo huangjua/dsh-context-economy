@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/dsh-context-economy",
   "version": "0.0.1",
-  "description": "Token-efficient project reading: symbol/import index with mtime self-heal + byte-slice reader for huge single-line files",
+  "description": "Token-efficient project reading with symbol/import indexing, PageRank topology, and byte-level slicing for DSH",
   "private": true,
   "type": "module",
   "main": "./lib/index.js",
