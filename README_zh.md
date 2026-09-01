@@ -49,17 +49,16 @@ dev_inject_plugin @dsh-external/dsh-context-economy
 本插件是 **DSH Agent 开发者效率套件** 的核心成员 —— 4 个插件无硬依赖，组合使用实现完整工程闭环：
 
 ```mermaid
-graph LR
-    M["🧠 <b>dsh-local-memory</b><br/><i>1. 跨会话记住规则与偏好</i>"] 
-    --> E["⚡ <b>dsh-context-economy</b><br/><i>2. 省 80%+ Token 读代码</i>"]
-    --> A["🛡️ <b>dsh-evidence</b><br/><i>3. 任务执行与交付存证</i>"]
-    --> S["🔍 <b>dsh-session-index</b><br/><i>4. 中文会话检索与书签</i>"]
-    --> M
+flowchart LR
+    M["🧠 dsh-local-memory<br>(1. 跨会话记住规则与偏好)"] --> E["⚡ dsh-context-economy<br>(2. 省 80%+ Token 读代码)"]
+    E --> A["🛡️ dsh-evidence<br>(3. 任务执行与交付存证)"]
+    A --> S["🔍 dsh-session-index<br>(4. 中文会话检索与书签)"]
+    S --> M
 
-    style M fill:#e8f4fd,stroke:#2b7de9,stroke-width:2px;
-    style E fill:#eef9f2,stroke:#1e8e3e,stroke-width:2px;
-    style A fill:#fef7e0,stroke:#f29900,stroke-width:2px;
-    style S fill:#f3e8fd,stroke:#8430ce,stroke-width:2px;
+    style M fill:#e8f4fd,stroke:#2b7de9,stroke-width:2px
+    style E fill:#eef9f2,stroke:#1e8e3e,stroke-width:2px
+    style A fill:#fef7e0,stroke:#f29900,stroke-width:2px
+    style S fill:#f3e8fd,stroke:#8430ce,stroke-width:2px
 ```
 
 | 插件 | 套件定位 | 与上下文经济层的协作 |

@@ -49,17 +49,16 @@ dev_inject_plugin @dsh-external/dsh-context-economy
 This plugin is part of the **DSH Agent Power Suite** — 4 modular, zero-hard-dependency plugins forming a complete closed-loop developer workflow:
 
 ```mermaid
-graph LR
-    M["🧠 <b>dsh-local-memory</b><br/><i>1. Remember rules & prefs</i>"] 
-    --> E["⚡ <b>dsh-context-economy</b><br/><i>2. Save 80%+ tokens reading code</i>"]
-    --> A["🛡️ <b>dsh-evidence</b><br/><i>3. Tamper-proof audit receipts</i>"]
-    --> S["🔍 <b>dsh-session-index</b><br/><i>4. CJK search & bookmarks</i>"]
-    --> M
+flowchart LR
+    M["🧠 dsh-local-memory<br>(1. Remember rules & prefs)"] --> E["⚡ dsh-context-economy<br>(2. Save 80%+ tokens reading code)"]
+    E --> A["🛡️ dsh-evidence<br>(3. Tamper-proof audit receipts)"]
+    A --> S["🔍 dsh-session-index<br>(4. CJK search & bookmarks)"]
+    S --> M
 
-    style M fill:#e8f4fd,stroke:#2b7de9,stroke-width:2px;
-    style E fill:#eef9f2,stroke:#1e8e3e,stroke-width:2px;
-    style A fill:#fef7e0,stroke:#f29900,stroke-width:2px;
-    style S fill:#f3e8fd,stroke:#8430ce,stroke-width:2px;
+    style M fill:#e8f4fd,stroke:#2b7de9,stroke-width:2px
+    style E fill:#eef9f2,stroke:#1e8e3e,stroke-width:2px
+    style A fill:#fef7e0,stroke:#f29900,stroke-width:2px
+    style S fill:#f3e8fd,stroke:#8430ce,stroke-width:2px
 ```
 
 | Plugin | Role in Suite | Synergy with Context Economy |
