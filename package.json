@@ -11,6 +11,15 @@
     "cordis.patch.yml",
     "README.md"
   ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "dsh-power-suite",
+    "dsh-context",
+    "context-compression",
+    "token-saving",
+    "pagerank"
+  ],
   "license": "BSD-3-Clause",
   "peerDependencies": {
     "@deepseek-ai/dsh-llm": "0.1.1-rc.2 || 0.1.2-alpha.3",
