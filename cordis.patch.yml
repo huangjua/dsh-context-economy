@@ -1,0 +1,5 @@
+# dsh-context-economy bundle 层：插入项目索引插件行。
+- insert:
+    - id: dsh-context-economy
+      name: '@dsh-external/dsh-context-economy'
+      config: {}
