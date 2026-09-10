@@ -4,3 +4,6 @@ lib/
 .compat-home/
 *.tsbuildinfo
 *.tgz
+
+*.bak"
+*.bak-*

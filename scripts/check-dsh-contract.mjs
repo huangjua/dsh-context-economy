@@ -1,17 +1,16 @@
 #!/usr/bin/env node
 /**
- * Verify that this plugin is developed and resolved against one alpha.3 DSH
- * runtime. The peer ranges retain rc2 compatibility, while the local build
- * and lockfile are intentionally pinned to alpha.3.
+ * Verify that this plugin is developed and resolved against one rc.1 DSH
+ * runtime. The peer ranges and local build are intentionally pinned to rc.1.
  */
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 const root = process.cwd()
-const alpha = '0.1.2-alpha.3'
+const target = '0.1.5-rc.1'
 const expected = {
-  '@deepseek-ai/dsh-llm': alpha,
-  '@deepseek-ai/dsh-tools': alpha,
+  '@deepseek-ai/dsh-llm': target,
+  '@deepseek-ai/dsh-tools': target,
   '@deepseek-ai/cordis': '4.0.2',
   '@deepseek-ai/schemastery': '3.18.2',
 }
@@ -26,8 +25,8 @@ function check(section, name, expectedValue) {
   }
 }
 
-if (packageJson.peerDependencies?.['@deepseek-ai/dsh-llm'] !== '0.1.1-rc.2 || 0.1.2-alpha.3') fail('dsh-llm peer range must retain rc2 and alpha.3')
-if (packageJson.peerDependencies?.['@deepseek-ai/dsh-tools'] !== '0.1.1-rc.2 || 0.1.2-alpha.3') fail('dsh-tools peer range must retain rc2 and alpha.3')
+if (packageJson.peerDependencies?.['@deepseek-ai/dsh-llm'] !== target) fail(`dsh-llm peer range must target ${target}`)
+if (packageJson.peerDependencies?.['@deepseek-ai/dsh-tools'] !== target) fail(`dsh-tools peer range must target ${target}`)
 if (packageJson.peerDependencies?.['@deepseek-ai/cordis'] !== '4.0.1 || 4.0.2') fail('cordis peer range must retain 4.0.1 and 4.0.2')
 if (packageJson.peerDependencies?.['@deepseek-ai/schemastery'] !== '3.18.1 || 3.18.2') fail('schemastery peer range must retain 3.18.1 and 3.18.2')
 for (const [name, version] of Object.entries(expected)) check('devDependencies', name, version)
@@ -52,7 +51,7 @@ for (const [name, version] of Object.entries(expected)) {
     fail(`pnpm-lock.yaml importer is missing ${name}`)
     continue
   }
-  const expectedSpecifier = name.startsWith('@deepseek-ai/dsh-') ? alpha : version
+  const expectedSpecifier = name.startsWith('@deepseek-ai/dsh-') ? target : version
   if (entry.specifier !== expectedSpecifier) fail(`pnpm-lock.yaml importer ${name} specifier is ${String(entry.specifier)}, expected ${expectedSpecifier}`)
   if (!entry.version?.startsWith(version)) fail(`pnpm-lock.yaml importer ${name} resolves ${String(entry.version)}, expected ${version}`)
 }
@@ -80,7 +79,7 @@ function visit(name, base) {
 }
 for (const name of Object.keys(expected)) visit(name, root)
 for (const [name, found] of versions) {
-  if (found.size !== 1 || !found.has(alpha)) fail(`resolver-visible ${name} versions are ${[...found].join(', ')}, expected only ${alpha}`)
+  if (found.size !== 1 || !found.has(target)) fail(`resolver-visible ${name} versions are ${[...found].join(', ')}, expected only ${target}`)
 }
 for (const name of ['@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-tools']) {
   if (!versions.has(name)) fail(`resolver could not reach ${name}`)
@@ -91,5 +90,5 @@ if (errors.length) {
   for (const error of errors) console.error(`- ${error}`)
   process.exitCode = 1
 } else {
-  console.log(`COMPATIBLE: DSH ${alpha}; Cordis ${expected['@deepseek-ai/cordis']}; Schemastery ${expected['@deepseek-ai/schemastery']}`)
+  console.log(`COMPATIBLE: DSH ${target}; Cordis ${expected['@deepseek-ai/cordis']}; Schemastery ${expected['@deepseek-ai/schemastery']}`)
 }
