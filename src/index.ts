@@ -11,8 +11,8 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { mkdirSync, appendFileSync, statSync } from 'node:fs'
-import { join, resolve, isAbsolute, relative } from 'node:path'
+import { mkdirSync, appendFileSync, statSync, readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs'
+import { join, resolve, isAbsolute, relative, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
@@ -43,6 +43,7 @@ const DEFAULT_SKIP = ['.git', 'node_modules', 'dist', 'out', 'build', 'coverage'
 
 export interface Config {
   rootDir: string
+  cacheDir: string
   skipDirs: string
   includeExts: string
   maxScanBytes: number
@@ -57,8 +58,12 @@ export interface Config {
   historyMaxRows: number
 }
 
+/** 显式注解：避免 TS2742（推断类型引用 .pnpm 内部路径，不可移植）。
+ *  用 as 断言而非精确类型：字段契约由上方 `interface Config` 保证，apply() 以 config: Config 读取。 */
 export const Config = z.object({
   rootDir: z.string().default(''),
+  /** 索引/账本/历史/spill 的存放目录；空 = DSH_HOME/project-index（默认跟随 DSH_HOME，保持测试与多 profile 隔离）。桌面端可在 cordis.patch.yml 里覆写为 E:/Do Something/DSH备份/project-index */
+  cacheDir: z.string().default(''),
   skipDirs: z.string().default(DEFAULT_SKIP),
   includeExts: z.string().default(DEFAULT_EXTS),
   maxScanBytes: z.number().min(1024).max(16 * 1024 * 1024).default(512 * 1024),
@@ -71,14 +76,19 @@ export const Config = z.object({
   savingsEnabled: z.boolean().default(true),
   savingsMaxRows: z.number().min(1).max(1_000_000).default(500),
   historyMaxRows: z.number().min(1).max(1_000_000).default(200),
-})
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- 断言为 any 壓平 TS2742 的 .pnpm 内部路径引用；
+// 字段契约由上方 interface Config 保证（apply(config: Config)），运行时 schema 行为不变
+}) as any
 
 const text = (s: string): ContentBlock[] => [{ type: 'text', text: s }]
 
 export function apply(ctx: AppContext, config: Config): void {
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
-  const cacheDir = join(dshHome, 'project-index')
-  const logFile = config.logFile || join(dshHome, 'super-injector', 'dsh-project-index.log')
+  // 显式配置优先；未配置回退 DSH_HOME/project-index（跟随 DSH_HOME 使测试隔离、多 profile 不串数据）
+  const cacheDir = cwdAbs(config.cacheDir || join(dshHome, 'project-index'))
+  // 日志跟随 cacheDir（默认 DSH_HOME/project-index，跟随 DSH_HOME 使测试隔离、多 profile 不串数据）；
+  // 显式 config.logFile 仍最高优先。不再写死 C 盘的 super-injector 目录。
+  const logFile = config.logFile || join(cacheDir, 'dsh-project-index.log')
   const defaultRoot = config.rootDir ? cwdAbs(config.rootDir) : ''
 
   const opts: IndexOptions = {
@@ -127,12 +137,51 @@ export function apply(ctx: AppContext, config: Config): void {
     }
   }
 
+  /** log 写失败告警的独立标志位（与 savings 的 warnOnce 分开，最多告警一次） */
+  let logWriteWarned = false
+  /** 日志大小封顶：超过 1MB 只保留尾部一半（daemon 每 tick 每 root 一行，无封顶会无限涨盘） */
+  const LOG_MAX_BYTES = 1024 * 1024
+
+  function logWarnOnce(err: unknown): void {
+    if (logWriteWarned) return
+    logWriteWarned = true
+    try {
+      console.error('[dsh-context-economy] log 写入失败（后续同类失败不再重复告警）:', err instanceof Error ? err.message : String(err))
+    } catch {
+      /* console 不可用则静默 */
+    }
+  }
+
+  /** 大小封顶：>1MB 时只保留尾部一半（读文件 → slice 后半 → 写 .tmp → 原子 rename）。
+   *  文件还不存在（stat 失败）是首次写入前的常态，不算失败、直接走 append。 */
+  function trimLogIfNeeded(): void {
+    let oversize = false
+    try {
+      oversize = statSync(logFile).size > LOG_MAX_BYTES
+    } catch {
+      return
+    }
+    if (!oversize) return
+    try {
+      const text = readFileSync(logFile, 'utf8')
+      const lines = text.split('\n')
+      const half = lines.slice(Math.floor(lines.length / 2)).filter((l) => l.trim() !== '')
+      const tmp = logFile + '.tmp'
+      writeFileSync(tmp, half.join('\n') + (half.length ? '\n' : ''), 'utf8')
+      renameSync(tmp, logFile)
+    } catch (err) {
+      // 裁剪失败不致命：本轮照常 append，下轮再试；最多告警一次
+      logWarnOnce(err)
+    }
+  }
+
   function log(msg: string): void {
     try {
-      mkdirSync(join(dshHome, 'super-injector'), { recursive: true })
+      mkdirSync(dirname(logFile), { recursive: true })
+      trimLogIfNeeded()
       appendFileSync(logFile, `[${new Date().toISOString()}] ${msg}\n`)
     } catch {
-      /* 日志失败静默 */
+      /* 日志失败静默（append/mkdir 失败不逐次告警，避免放大日志开销） */
     }
   }
 
@@ -291,6 +340,7 @@ export function apply(ctx: AppContext, config: Config): void {
       kind: { type: 'string', description: '过滤 kind：function/class/const/type/interface/func/fn' },
       limit: { type: 'integer', description: '内联返回上限，缺省用 maxHits' },
       ranking: { type: 'boolean', description: '为 true 时按匹配度(完整名>前缀>子串)优先、组内按所在文件 PageRank 降序排列；缺省 false 保持旧 file+line 顺序（输出与升级前一致）' },
+      boostFiles: { type: 'array', items: { type: 'string' }, description: '（进阶，仅 ranking=true 生效）会话中已提及/正在编辑的文件路径集合，命中这些文件的符号排名提前（aider repomap「mentioned files」思路，只改排序不改命中集合）' },
     },
     output: {
       schema: {
@@ -330,14 +380,19 @@ export function apply(ctx: AppContext, config: Config): void {
     },
     execute: measured('project_symbols_find', async (args) => {
       const idx = indexerFor(args.root)
-      const { hits, matchedFileBytes } = idx.findSymbols(args.name, args.kind, args.ranking === true)
+      const boost = Array.isArray(args.boostFiles) ? args.boostFiles.filter((x: unknown): x is string => typeof x === 'string') : undefined
+      const { hits, matchedFileBytes } = idx.findSymbols(args.name, args.kind, args.ranking === true, boost)
       const limit = Math.max(1, Math.floor(args.limit ?? config.maxHits))
       const kept = hits.slice(0, limit)
       let spillPath = ''
       let spillCount = 0
       if (hits.length > limit) {
-        spillPath = idx.writeSpill(hits.slice(limit), cacheDir, 'symbols').path
-        spillCount = hits.length - limit
+        // writeSpill 失败返回 null：降级为只返回内联 top-N（spillPath 空，前端不渲染 spill 行）
+        const sp = idx.writeSpill(hits.slice(limit), cacheDir, 'symbols')
+        if (sp) {
+          spillPath = sp.path
+          spillCount = hits.length - limit
+        }
       }
       return {
         root: idx.root,
@@ -426,8 +481,11 @@ export function apply(ctx: AppContext, config: Config): void {
         let spillPath = ''
         let spillCount = 0
         if (rows.length > limit) {
-          spillPath = idx.writeSpill(rows.slice(limit), cacheDir, 'imports-' + dir).path
-          spillCount = rows.length - limit
+          const sp = idx.writeSpill(rows.slice(limit), cacheDir, 'imports-' + dir)
+          if (sp) {
+            spillPath = sp.path
+            spillCount = rows.length - limit
+          }
         }
         return {
           root: idx.root,
@@ -445,8 +503,11 @@ export function apply(ctx: AppContext, config: Config): void {
       let spillPath = ''
       let spillCount = 0
       if (edges.length > limit) {
-        spillPath = idx.writeSpill(edges.slice(limit), cacheDir, 'imports').path
-        spillCount = edges.length - limit
+        const sp = idx.writeSpill(edges.slice(limit), cacheDir, 'imports')
+        if (sp) {
+          spillPath = sp.path
+          spillCount = edges.length - limit
+        }
       }
       return {
         root: idx.root,
@@ -506,8 +567,11 @@ export function apply(ctx: AppContext, config: Config): void {
       let spillPath = ''
       let spillCount = 0
       if (list.length > limit) {
-        spillPath = idx.writeSpill(list.slice(limit), cacheDir, 'files').path
-        spillCount = list.length - limit
+        const sp = idx.writeSpill(list.slice(limit), cacheDir, 'files')
+        if (sp) {
+          spillPath = sp.path
+          spillCount = list.length - limit
+        }
       }
       return {
         root: idx.root,
@@ -534,7 +598,7 @@ export function apply(ctx: AppContext, config: Config): void {
       findFrom: { type: 'integer', description: 'find 搜索起始字节偏移，配合 nextByteOffset 翻页' },
       contextBefore: { type: 'integer', description: 'find 命中时往前带多少字节上下文，缺省 256' },
       mode: { type: 'string', enum: ['window', 'tail'], description: 'window=按 startBytes/find 定位（默认）；tail=从文件尾部读 lengthBytes 窗口（日志场景，find 不适用）' },
-      re: { type: 'boolean', description: 'find 按正则（大小写不敏感）。默认 false 字面量子串（行为不变）；re:true 需 find.length≤256，单块 10ms 超时防 ReDoS' },
+      re: { type: 'boolean', description: 'find 按正则（大小写不敏感）。默认 false 字面量子串（行为不变）；re:true 需 find.length≤256，正则在独立线程执行并有界中断（默认 250ms，超时抛 slice_find_regex_timeout），ReDoS 不会阻塞主线程' },
     },
     output: {
       schema: {
@@ -568,7 +632,7 @@ export function apply(ctx: AppContext, config: Config): void {
     execute: measured('project_slice_read', async (args) => {
       const idx = indexerFor(args.root)
       const abs = isAbsolute(args.path) ? resolve(args.path) : resolve(idx.root, args.path)
-      const r = sliceRead(abs, {
+      const r = await sliceRead(abs, {
         startBytes: args.startBytes,
         lengthBytes: args.lengthBytes ?? config.sliceBytes,
         find: args.find || undefined,
@@ -674,7 +738,7 @@ export function apply(ctx: AppContext, config: Config): void {
   /* ────────── 工具 7：常驻记账查询（Part A） ────────── */
   const toolSavings = defineTool({
     name: 'project_savings',
-    description: '常驻记账查询：累计每次 project_symbols_find / project_imports / project_slice_read 调用“朴素整文件读取 vs 指针输出”的节省（chars/naiveBytes/savedTokens）。可按 root / 工具过滤，返回累计聚合、按工具/按 root 分组与最近 N 次记录；超量落盘。token 开销极低（顺序读 savings.jsonl）。',
+    description: '常驻记账查询：累计每次 project_symbols_find / project_imports / project_slice_read 调用“朴素整文件读取 vs 指针输出”的节省（chars/naiveBytes/savedTokens）。可按 root / 工具过滤，返回累计聚合、按工具/按 root 分组与最近 N 次记录；超量落盘。token 开销极低（顺序读 savings.jsonl）。口径注意：savedTokens 是相对「命中文件整读」基线的估算上界（≈bytes/4），非真实计费差；重复查询（dupCalls）的节省未去重。',
     parameters: {
       root: { type: 'string', description: '按 root（绝对路径）过滤；缺省不过滤' },
       tool: { type: 'string', enum: ['project_symbols_find', 'project_imports', 'project_slice_read'], description: '按工具过滤；缺省不过滤' },
@@ -746,6 +810,7 @@ export function apply(ctx: AppContext, config: Config): void {
         if (vv.enabled) {
           const a = vv.aggregate ?? {}
           lines.push(` aggregate: calls=${a.calls} failures=${a.failures} dup=${a.dupCalls} chars=${a.chars} naiveBytes=${a.naiveBytes} saved≈${a.savedTokens} tokens (${a.savedPct}%)`)
+          lines.push(` note: 上限口径=整读基线估算${typeof a.dupCalls === 'number' ? `; dup=${a.dupCalls} 条未去重` : ''}`)
           for (const g of vv.byTool ?? []) lines.push(`  byTool ${g.key}: calls=${g.calls} saved≈${g.savedTokens}t`)
           for (const g of vv.byRoot ?? []) lines.push(`  byRoot ${g.key}: calls=${g.calls} saved≈${g.savedTokens}t`)
           const rows = vv.recent ?? []
@@ -840,8 +905,11 @@ export function apply(ctx: AppContext, config: Config): void {
       let spillPath = ''
       let spillCount = 0
       if (scan.entries.length > limit) {
-        spillPath = idx.writeSpill(scan.entries.slice(limit), cacheDir, 'json').path
-        spillCount = scan.entries.length - limit
+        const sp = idx.writeSpill(scan.entries.slice(limit), cacheDir, 'json')
+        if (sp) {
+          spillPath = sp.path
+          spillCount = scan.entries.length - limit
+        }
       }
       const out: any = {
         root: idx.root,
@@ -881,13 +949,31 @@ export function apply(ctx: AppContext, config: Config): void {
   // 后台自愈：Node 全局定时器（不依赖 timer 服务，unref 不阻进程退出）。
   // apply 一次只产生一个 timer（本 apply 闭包内唯一）。
   const daemonTimer = setInterval(() => {
+    // 迭代中删除 Map 条目在 JS 里是安全的，但仍先收集再删（稳妥，避免未来重构踩坑）
+    const vanished: string[] = []
     for (const [root, idx] of indexers) {
       try {
+        // root 已消失则不必再让 ensure 抛错：existsSync 预判直接摘除（Map key 与 idx.root
+        // 同为 cwdAbs 归一值），err.message 含「root 不存在」时兜底摘除
+        if (!existsSync(root)) {
+          vanished.push(root)
+          continue
+        }
         const rep = idx.ensure()
         log(`heal root=${root} files=${rep.totalFiles} scanned=${rep.scannedBytes}B rescanned=${rep.rescannedFiles} added=${rep.addedFiles} dropped=${rep.droppedFiles} symbols=${rep.symbols} imports=${rep.imports}`)
       } catch (e) {
-        log(`heal failed root=${root}: ${String(e).slice(0, 200)}`)
+        const msg = e instanceof Error ? e.message : String(e)
+        if (msg.includes('root 不存在')) {
+          // 目录已消失：从 Map 摘除实例，终止每 5 分钟一条的 heal failed 刷屏
+          vanished.push(root)
+          continue
+        }
+        log(`heal failed root=${root}: ${msg.slice(0, 200)}`)
       }
+    }
+    for (const root of vanished) {
+      indexers.delete(root)
+      log(`drop root=${root}（目录已消失）`)
     }
   }, config.intervalMs)
   if (typeof daemonTimer === 'object' && daemonTimer !== null && 'unref' in daemonTimer) {

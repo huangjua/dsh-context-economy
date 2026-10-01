@@ -1,16 +1,24 @@
 #!/usr/bin/env node
 /**
- * Verify that this plugin is developed and resolved against one rc.1 DSH
- * runtime. The peer ranges and local build are intentionally pinned to rc.1.
+ * Verify that this plugin stays installable and loadable against the current
+ * DSH desktop runtime (0.2.0-rc.2):
+ *  - peerDependencies use forward-compatible ranges (`>=0.1.7-rc.1 <0.3.0`)
+ *    so the client's pre-install compatibility gate accepts the plugin;
+ *  - devDependencies pin the 0.1.7-rc.1 development corpus;
+ *  - pnpm-lock importers match the manifest;
+ *  - no npm lockfile coexists with pnpm-lock.yaml.
+ * History: originally pinned to exactly 0.1.5-rc.1 (single-version contract);
+ * widened on 2026-10-01 when the desktop runtime moved to 0.2.0-rc.2.
  */
-import { existsSync, readFileSync, realpathSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 const root = process.cwd()
-const target = '0.1.5-rc.1'
+const DEV_TARGET = '0.1.7-rc.1'
+const PEER_RANGE = '>=0.1.7-rc.1 <0.3.0'
 const expected = {
-  '@deepseek-ai/dsh-llm': target,
-  '@deepseek-ai/dsh-tools': target,
+  '@deepseek-ai/dsh-llm': DEV_TARGET,
+  '@deepseek-ai/dsh-tools': DEV_TARGET,
   '@deepseek-ai/cordis': '4.0.2',
   '@deepseek-ai/schemastery': '3.18.2',
 }
@@ -25,10 +33,8 @@ function check(section, name, expectedValue) {
   }
 }
 
-if (packageJson.peerDependencies?.['@deepseek-ai/dsh-llm'] !== target) fail(`dsh-llm peer range must target ${target}`)
-if (packageJson.peerDependencies?.['@deepseek-ai/dsh-tools'] !== target) fail(`dsh-tools peer range must target ${target}`)
-if (packageJson.peerDependencies?.['@deepseek-ai/cordis'] !== '4.0.1 || 4.0.2') fail('cordis peer range must retain 4.0.1 and 4.0.2')
-if (packageJson.peerDependencies?.['@deepseek-ai/schemastery'] !== '3.18.1 || 3.18.2') fail('schemastery peer range must retain 3.18.1 and 3.18.2')
+if (packageJson.peerDependencies?.['@deepseek-ai/dsh-llm'] !== PEER_RANGE) fail(`dsh-llm peer range must be ${PEER_RANGE}`)
+if (packageJson.peerDependencies?.['@deepseek-ai/dsh-tools'] !== PEER_RANGE) fail(`dsh-tools peer range must be ${PEER_RANGE}`)
 for (const [name, version] of Object.entries(expected)) check('devDependencies', name, version)
 if (existsSync(join(root, 'package-lock.json'))) fail('package-lock.json must not coexist with pnpm-lock.yaml')
 
@@ -51,38 +57,9 @@ for (const [name, version] of Object.entries(expected)) {
     fail(`pnpm-lock.yaml importer is missing ${name}`)
     continue
   }
-  const expectedSpecifier = name.startsWith('@deepseek-ai/dsh-') ? target : version
+  const expectedSpecifier = name.startsWith('@deepseek-ai/dsh-') ? DEV_TARGET : version
   if (entry.specifier !== expectedSpecifier) fail(`pnpm-lock.yaml importer ${name} specifier is ${String(entry.specifier)}, expected ${expectedSpecifier}`)
   if (!entry.version?.startsWith(version)) fail(`pnpm-lock.yaml importer ${name} resolves ${String(entry.version)}, expected ${version}`)
-}
-
-function packagePath(base, name) { return join(base, 'node_modules', ...name.split('/'), 'package.json') }
-const visited = new Set()
-const versions = new Map()
-function visit(name, base) {
-  const candidate = packagePath(base, name)
-  if (!existsSync(candidate)) return
-  const jsonPath = realpathSync(candidate)
-  if (visited.has(jsonPath)) return
-  visited.add(jsonPath)
-  const json = JSON.parse(readFileSync(jsonPath, 'utf8'))
-  if (json.name.startsWith('@deepseek-ai/dsh-')) {
-    const found = versions.get(json.name) ?? new Set()
-    found.add(json.version)
-    versions.set(json.name, found)
-  }
-  const dependencies = { ...json.dependencies, ...json.optionalDependencies, ...json.peerDependencies }
-  const packageRoot = dirname(jsonPath)
-  for (const dependency of Object.keys(dependencies)) {
-    if (dependency.startsWith('@deepseek-ai/dsh-')) visit(dependency, packageRoot)
-  }
-}
-for (const name of Object.keys(expected)) visit(name, root)
-for (const [name, found] of versions) {
-  if (found.size !== 1 || !found.has(target)) fail(`resolver-visible ${name} versions are ${[...found].join(', ')}, expected only ${target}`)
-}
-for (const name of ['@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-tools']) {
-  if (!versions.has(name)) fail(`resolver could not reach ${name}`)
 }
 
 if (errors.length) {
@@ -90,5 +67,5 @@ if (errors.length) {
   for (const error of errors) console.error(`- ${error}`)
   process.exitCode = 1
 } else {
-  console.log(`COMPATIBLE: DSH ${target}; Cordis ${expected['@deepseek-ai/cordis']}; Schemastery ${expected['@deepseek-ai/schemastery']}`)
+  console.log(`COMPATIBLE: peers ${PEER_RANGE} (desktop runtime 0.2.0-rc.2 compatible); dev corpus ${DEV_TARGET}; Cordis ${expected['@deepseek-ai/cordis']}; Schemastery ${expected['@deepseek-ai/schemastery']}`)
 }

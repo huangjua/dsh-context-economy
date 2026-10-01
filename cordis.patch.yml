@@ -1,5 +1,8 @@
 # dsh-context-economy bundle 层：插入项目索引插件行。
+# cacheDir 指向 E 盘归档区（索引/账本/heal-history/spill 都落这里，C 盘 .dsh 不再增长）；
+# 想改回默认（DSH_HOME/project-index）就删掉 config.cacheDir 这一行。
 - insert:
     - id: dsh-context-economy
       name: '@dsh-external/dsh-context-economy'
-      config: {}
+      config:
+        cacheDir: 'E:/Do Something/DSH备份/project-index'

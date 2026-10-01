@@ -15,7 +15,9 @@
  *  - bowenliang123/dsh-context（MIT）compactions/prunes 统计口径 → 字段命名参考。
  *  - tinqiao-oss/engramory（MIT）cap hook → savingsMaxRows 总量封顶淘汰。
  *
- * 存储：~/.dsh/project-index/savings.jsonl，append-only，写失败静默（对齐现有 log 哲学）。
+ * 存储：~/.dsh/project-index/savings.jsonl，append-only；写失败最多 console.error 告警一次
+ * （模块级标志位，后续同类失败静默），绝不向上抛。trim 采用迟滞触发（rowCount ≥ 2×maxRows
+ * 才裁），把全量重写从"每次追加"降为"每 maxRows 次追加一次"，同时最小化共写并发窗口。
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -160,6 +162,20 @@ export function spillRows(rows: unknown[], cacheDir: string, kind: string): { pa
 
 /* ────────────────────────── 账本 ────────────────────────── */
 
+/** 写失败告警的模块级标志位：最多告警一次，之后同类失败静默（避免刷屏 / 放大日志开销） */
+let savingsWriteWarned = false
+
+/** 统一的"最多告警一次"失败处理：首个失败 console.error，后续静默；绝不向上抛 */
+function warnOnce(err: unknown): void {
+  if (savingsWriteWarned) return
+  savingsWriteWarned = true
+  try {
+    console.error('[dsh-context-economy] savings ledger 写入失败（后续同类失败不再重复告警）:', err instanceof Error ? err.message : String(err))
+  } catch {
+    /* console 不可用时保持静默 */
+  }
+}
+
 export class SavingsLedger {
   readonly file: string
   readonly maxRows: number
@@ -176,7 +192,9 @@ export class SavingsLedger {
       if (!existsSync(this.file)) return (this.rowCount = 0)
       const buf = readFileSync(this.file, 'utf8')
       this.rowCount = buf === '' ? 0 : buf.split('\n').filter((l) => l.trim() !== '').length
-    } catch {
+    } catch (err) {
+      // 数行失败按空账本继续（保持原容错语义），但至少可见一次
+      warnOnce(err)
       this.rowCount = 0
     }
     return this.rowCount
@@ -187,29 +205,40 @@ export class SavingsLedger {
     try {
       const text = readFileSync(this.file, 'utf8')
       const lines = text.split('\n').filter((l) => l.trim() !== '')
-      if (lines.length <= this.maxRows) return
+      if (lines.length <= this.maxRows) {
+        // 实际行数与计数器不一致（如另一实例已裁剪）时按实际值校正记账
+        this.rowCount = lines.length
+        return
+      }
       const kept = lines.slice(lines.length - this.maxRows)
       const tmp = this.file + '.tmp'
       writeFileSync(tmp, kept.join('\n') + (kept.length ? '\n' : ''), 'utf8')
       renameSync(tmp, this.file)
       this.rowCount = kept.length
-    } catch {
-      /* 裁剪失败静默 */
+    } catch (err) {
+      // 裁剪失败不致命：账本继续 append，下次到达迟滞阈值再试
+      warnOnce(err)
     }
   }
 
-  /** append-only 写入一行；写失败静默（对齐现有 log 哲学），调用方保证启用时才调 */
+  /**
+   * append-only 写入一行；写失败最多告警一次（不抛），调用方保证启用时才调。
+   * trim 迟滞触发：仅当rowCount ≥ 2×maxRows 才裁剪——稳态下全量重写频率从
+   * "每 1 次追加"降为"每 maxRows 次追加"，共写另一实例丢行的并发窗口也随之最小化。
+   */
   record(row: Omit<SavingsRow, 'ts'>): void {
+    // 先数行再加一（避免 append 后 countLines 读到新行导致计数器漂移）
+    const n = this.countLines() + 1
     try {
       mkdirSync(dirname(this.file), { recursive: true })
-      // 先数行再加一（避免 append 后 countLines 读到新行导致计数器漂移）
-      const n = this.countLines() + 1
       appendFileSync(this.file, JSON.stringify({ ts: Date.now(), ...row }) + '\n', 'utf8')
       this.rowCount = n
-      if (n > this.maxRows) this.trim()
-    } catch {
-      /* 静默 */
+    } catch (err) {
+      // append 失败：这行没写出去，计数器不能 +1（成功才记账）；不抛，最多告警一次
+      warnOnce(err)
+      return
     }
+    if (n >= 2 * this.maxRows) this.trim()
   }
 
   /** 顺序读 + 聚合的原料：逐行解析，坏行跳过计数 */
