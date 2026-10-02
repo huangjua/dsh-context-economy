@@ -2,7 +2,7 @@
  * dsh-context-economy — savings accounting（常驻记账，§12 Part A 落地）
  * -------------------------------------------------------------------
  * 把 project_cost_probe 的"点测"升级为常驻记账：每次
- *   project_symbols_find / project_imports / project_slice_read
+ *   project_symbols_find / project_imports / project_slice_read / project_json_read
  * 调用自动累计"朴素整文件读取 vs 指针输出"的差（chars / naiveBytes / savedTokens），
  * 新增 project_savings 工具查询（按工具 / 按 root / 累计与最近 N 次，超量落盘）。
  *
@@ -20,7 +20,7 @@
  * 才裁），把全量重写从"每次追加"降为"每 maxRows 次追加一次"，同时最小化共写并发窗口。
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import { estimateTokens } from './core.js'
 
@@ -30,9 +30,9 @@ import { estimateTokens } from './core.js'
 export interface SavingsRow {
   /** epoch ms */
   ts: number
-  /** 查询 root（绝对路径；未知时 '(default)'） */
+  /** 查询 root（绝对路径；未配置且未传 root 时 '(unconfigured)'） */
   root: string
-  /** 工具名：project_symbols_find / project_imports / project_slice_read */
+  /** 工具名：project_symbols_find / project_imports / project_slice_read / project_json_read */
   tool: string
   /** sha1(tool|root|canonicalArgs) 前 16 位 —— hash suppression 记账视角（重复命中可识别） */
   argsHash: string
@@ -97,6 +97,8 @@ export interface WrapMeasuredOptions {
   naiveBytes: (args: any, result: any) => number
   /** 从 args/result 取 root */
   rootOf: (args: any, result: any) => string
+  /** Effective defaults/paths used for repeat identity; only called when enabled. */
+  normalizeArgs?: (args: any) => unknown
 }
 
 /* ────────────────────────── 纯函数 ────────────────────────── */
@@ -110,7 +112,12 @@ export function savedTokensOf(naiveBytes: number, chars: number): number {
 export function hashArgs(tool: string, root: string, args: unknown): string {
   let canon = ''
   try {
-    canon = JSON.stringify(args ?? {})
+    canon = JSON.stringify(args ?? {}, (_key, value) => {
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]]))
+      }
+      return value
+    })
   } catch {
     canon = String(args)
   }
@@ -273,6 +280,7 @@ export class SavingsLedger {
   }
 
   query(opts: SavingsQueryOptions = {}): SavingsQueryResult {
+    if (opts.root) opts = { ...opts, root: resolve(opts.root) }
     const { rows, corruptLines } = this.readRows()
     const filtered = rows.filter((r) => {
       if (opts.root && r.root !== opts.root) return false
@@ -311,16 +319,16 @@ export class SavingsLedger {
  * savedTokens 并记账。不改变工具输出（原样返回 result）；失败照常重抛（先记一行 failed）。
  * ledger=null（savingsEnabled:false）时零开销直通，连 JSON.stringify 都不做。
  */
-export function wrapMeasured<TArgs, TResult>(
+export function wrapMeasured<TArgs, TResult, TExec = unknown>(
   toolName: string,
-  execute: (args: TArgs) => TResult | Promise<TResult>,
+  execute: (args: TArgs, exec?: TExec) => TResult | Promise<TResult>,
   opts: WrapMeasuredOptions,
-): (args: TArgs) => Promise<TResult> {
-  return async (args) => {
-    if (!opts.ledger) return execute(args)
+): (args: TArgs, exec?: TExec) => Promise<TResult> {
+  return async (args, exec) => {
+    if (!opts.ledger) return execute(args, exec)
     let result: TResult | undefined
     try {
-      result = await execute(args)
+      result = await execute(args, exec)
     } catch (err) {
       // 失败也记账（failures 计数），然后照常抛给调用方——不改变工具失败行为
       try {
@@ -328,7 +336,7 @@ export function wrapMeasured<TArgs, TResult>(
         opts.ledger.record({
           root,
           tool: toolName,
-          argsHash: hashArgs(toolName, root, args),
+          argsHash: hashArgs(toolName, root, opts.normalizeArgs ? opts.normalizeArgs(args) : args),
           chars: 0,
           naiveBytes: 0,
           savedTokens: 0,
@@ -346,7 +354,7 @@ export function wrapMeasured<TArgs, TResult>(
       opts.ledger.record({
         root,
         tool: toolName,
-        argsHash: hashArgs(toolName, root, args),
+        argsHash: hashArgs(toolName, root, opts.normalizeArgs ? opts.normalizeArgs(args) : args),
         chars,
         naiveBytes: naive,
         savedTokens: savedTokensOf(naive, chars),

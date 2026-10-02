@@ -30,7 +30,7 @@ const EXPECTED_TOOLS = [
 interface Tool { name: string }
 function makeCtx() {
   const tools: Record<string, Tool> = {}
-  const cleanups: (() => void)[] = []
+  const cleanups: (() => void | Promise<void>)[] = []
   const ctx = {
     tools: {
       register: (t: Tool) => {
@@ -40,14 +40,14 @@ function makeCtx() {
     },
     effect: (fn: () => unknown) => {
       const r = fn()
-      if (typeof r === 'function') cleanups.push(r as () => void)
+      if (typeof r === 'function') cleanups.push(r as () => void | Promise<void>)
     },
   }
   return { ctx, tools, cleanups }
 }
 
 /* ── fake timer：patch 全局 setInterval/clearInterval，可确定性触发 ── */
-const liveTimers = new Map<number, { cb: () => void; ms: number }>()
+const liveTimers = new Map<number, { cb: () => void | Promise<void>; ms: number }>()
 let nextTimerId = 1
 const realSetInterval = globalThis.setInterval
 const realClearInterval = globalThis.clearInterval
@@ -68,7 +68,7 @@ function restoreRealTimers(): void {
   globalThis.clearInterval = realClearInterval
 }
 const timerCount = (): number => liveTimers.size
-const fireTimer = (id: number): void => liveTimers.get(id)?.cb()
+const fireTimer = async (id: number): Promise<void> => { await liveTimers.get(id)?.cb() }
 
 const bases: string[] = []
 function makeTemp(prefix: string): string {
@@ -115,7 +115,7 @@ function withTempHome(home: string): () => void {
 describe('Part C 生命周期回归', () => {
   beforeEach(() => { liveTimers.clear(); nextTimerId = 1 })
 
-  it('首次加载：8 工具注册 + 恰好 1 个定时器；dispose 后 timer 归零、工具注销', () => {
+  it('首次加载：8 工具注册 + 恰好 1 个定时器；dispose 后 timer 归零、工具注销', async () => {
     const home = makeTemp('dsh-lc-home-')
     const proj = makeTemp('dsh-lc-proj-')
     writeFileSync(join(proj, 'a.ts'), 'export const a = 1')
@@ -126,7 +126,7 @@ describe('Part C 生命周期回归', () => {
       assert.deepEqual(Object.keys(tools).sort(), EXPECTED_TOOLS, '8 个工具全部注册')
       assert.equal(timerCount(), 1, 'apply 一次只产生一个 timer')
       assert.ok(cleanups.length >= 2, 'apply 应注册清理函数（工具注销 + timer 清理）')
-      for (const c of cleanups) c()
+      for (const c of cleanups) await c()
       assert.equal(timerCount(), 0, 'dispose 后 timer 归零')
       assert.deepEqual(Object.keys(tools).sort(), [], 'dispose 后工具全部注销')
     } finally {
@@ -149,16 +149,16 @@ describe('Part C 生命周期回归', () => {
       const before = readFileSync(hist, 'utf8').trim().split('\n').filter(Boolean).length
       const id = [...liveTimers.keys()][0]
       assert.ok(id, '应有 1 个 timer')
-      fireTimer(id) // daemon 一次 tick：增量 heal → history +1
+      await fireTimer(id) // 等待异步 daemon 到达资源静止点
       const after = readFileSync(hist, 'utf8').trim().split('\n').filter(Boolean).length
       assert.equal(after, before + 1, 'daemon tick 应追加一行 heal-history')
-      for (const c of cleanups) c()
+      for (const c of cleanups) await c()
     } finally {
       restore()
     }
   })
 
-  it('同进程再次加载 + 连续两次 reload：不叠加工具与定时器', () => {
+  it('同进程再次加载 + 连续两次 reload：不叠加工具与定时器', async () => {
     const home = makeTemp('dsh-lc-home3-')
     const proj = makeTemp('dsh-lc-proj3-')
     writeFileSync(join(proj, 'c.ts'), 'export const c = 3')
@@ -167,21 +167,21 @@ describe('Part C 生命周期回归', () => {
       const c1 = makeCtx()
       apply(c1.ctx as never, cfg(proj) as never)
       assert.equal(timerCount(), 1)
-      for (const c of c1.cleanups) c()
+      for (const c of c1.cleanups) await c()
       assert.equal(timerCount(), 0)
 
       const c2 = makeCtx()
       apply(c2.ctx as never, cfg(proj) as never)
       assert.deepEqual(Object.keys(c2.tools).sort(), EXPECTED_TOOLS, 'reload 后仍 8 工具（无重复）')
       assert.equal(timerCount(), 1, 'reload 后仅 1 timer')
-      for (const c of c2.cleanups) c()
+      for (const c of c2.cleanups) await c()
       assert.equal(timerCount(), 0)
 
       const c3 = makeCtx()
       apply(c3.ctx as never, cfg(proj) as never)
       assert.deepEqual(Object.keys(c3.tools).sort(), EXPECTED_TOOLS)
       assert.equal(timerCount(), 1)
-      for (const c of c3.cleanups) c()
+      for (const c of c3.cleanups) await c()
       assert.equal(timerCount(), 0)
       assert.equal(Object.keys(c1.tools).length + Object.keys(c2.tools).length, 0, '已 dispose 实例无工具残留')
     } finally {
@@ -202,8 +202,8 @@ describe('Part C 生命周期回归', () => {
       const before = readdirSync(cacheDir).filter((f) => f.startsWith('index-'))
       assert.ok(before.length >= 1, '首次 status 应建索引缓存')
       const id = [...liveTimers.keys()][0]
-      fireTimer(id) // daemon 增量 heal
-      for (const c of c1.cleanups) c()
+      await fireTimer(id) // daemon 增量 heal
+      for (const c of c1.cleanups) await c()
       assert.equal(timerCount(), 0, 'dispose 后 daemon 停（无后续缓存写入）')
 
       // 同进程重载：索引器重建，但磁盘缓存复用（mtime 自愈），不产生第二套/临时残留
@@ -214,7 +214,7 @@ describe('Part C 生命周期回归', () => {
       assert.deepEqual(after.sort(), before.sort(), '重载后索引缓存文件集不变（复用，无第二套）')
       const tmpLeft = readdirSync(cacheDir).filter((f) => f.endsWith('.tmp'))
       assert.deepEqual(tmpLeft, [], '无 *.tmp 残留')
-      for (const c of c2.cleanups) c()
+      for (const c of c2.cleanups) await c()
     } finally {
       restore()
     }

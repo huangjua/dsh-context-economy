@@ -4,21 +4,34 @@
  * never leaves .test-build in the package root and imports resolve against
  * this plugin's own dependency tree.
  */
-import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 
 const project = dirname(dirname(fileURLToPath(import.meta.url)))
-const outDir = join(project, 'node_modules', '.cache', 'test-build')
+// Resolve filters in Node; no shell-dependent globs or command interpolation.
+const available = readdirSync(join(project, 'test')).filter((f) => f.endsWith('.test.ts')).sort()
+const filters = process.argv.slice(2).filter((a) => a !== '--').map((a) => a.replace(/\.test\.ts$/, ''))
+for (const f of filters) {
+  if (!available.includes(f + '.test.ts')) throw new Error(`unknown test filter: ${f}`)
+}
+const selected = filters.length ? available.filter((f) => filters.includes(f.replace(/\.test\.ts$/, ''))) : available
+const cache = join(project, 'node_modules', '.cache')
+mkdirSync(cache, { recursive: true })
+const outDir = mkdtempSync(join(cache, 'test-build-'))
 const tsc = join(project, 'node_modules', 'typescript', 'bin', 'tsc')
-rmSync(outDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 150 })
-mkdirSync(outDir, { recursive: true })
+const config = join(outDir, 'tsconfig.json')
+writeFileSync(config, JSON.stringify({
+  extends: join(project, 'tsconfig.test.json'),
+  compilerOptions: { outDir },
+  include: [join(project, 'src'), ...selected.map((f) => join(project, 'test', f))],
+}))
 
 let exitCode = 0
 try {
   if (!existsSync(tsc)) throw new Error(`typescript compiler not found: ${tsc}; run pnpm install first`)
-  const compile = spawnSync(process.execPath, [tsc, '-p', join(project, 'tsconfig.test.json'), '--outDir', outDir], {
+  const compile = spawnSync(process.execPath, [tsc, '-p', config], {
     cwd: project,
     stdio: 'inherit',
     shell: false,

@@ -14,18 +14,21 @@ import z from '@deepseek-ai/schemastery'
 import { mkdirSync, appendFileSync, statSync, readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs'
 import { join, resolve, isAbsolute, relative, dirname } from 'node:path'
 import { homedir } from 'node:os'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { randomBytes } from 'node:crypto'
+import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import {
   ProjectIndexer,
-  sliceRead,
-  scanJsonKeys,
+  type SliceResult,
   cwdAbs,
   rootHash,
   estimateTokens,
   type IndexOptions,
 } from './core.js'
 import { SavingsLedger, wrapMeasured } from './savings.js'
+import { IndexJobs } from './index-jobs.js'
+import { sliceRead } from './slice.js'
+import type { JsonScanResult } from './json.js'
 
 type AppContext = Context & {
   setInterval(fn: () => void, ms: number): unknown
@@ -72,6 +75,7 @@ export const Config = z.object({
   sliceBytes: z.number().min(256).max(16 * 1024 * 1024).default(4096),
   intervalMs: z.number().min(5000).max(86_400_000).default(300_000),
   logFile: z.string().default(''),
+  // Deprecated compatibility setting: name matching is always case-insensitive.
   lowerNameOnly: z.boolean().default(true),
   savingsEnabled: z.boolean().default(true),
   savingsMaxRows: z.number().min(1).max(1_000_000).default(500),
@@ -90,6 +94,8 @@ export function apply(ctx: AppContext, config: Config): void {
   // 显式 config.logFile 仍最高优先。不再写死 C 盘的 super-injector 目录。
   const logFile = config.logFile || join(cacheDir, 'dsh-project-index.log')
   const defaultRoot = config.rootDir ? cwdAbs(config.rootDir) : ''
+  // A per-apply authentication key prevents edited continuation counts/offsets.
+  const cursorSecret = randomBytes(32).toString('hex')
 
   const opts: IndexOptions = {
     includeExts: config.includeExts.split(',').map((s) => s.trim()).filter(Boolean),
@@ -100,6 +106,23 @@ export function apply(ctx: AppContext, config: Config): void {
   }
 
   const indexers = new Map<string, ProjectIndexer>()
+  const lifetime = new AbortController()
+  const readers = new Set<IndexJobs>()
+  const directReads = new Set<Promise<unknown>>()
+  async function trackedRead<T>(reading: Promise<T>): Promise<T> {
+    directReads.add(reading)
+    try { return await reading } finally { directReads.delete(reading) }
+  }
+  const callSignal = (exec?: ToolRunContext) => exec?.signal
+    ? AbortSignal.any([lifetime.signal, exec.signal]) : lifetime.signal
+  async function readJob<T>(kind: 'json', payload: unknown, exec?: ToolRunContext): Promise<T> {
+    const signal = callSignal(exec)
+    signal.throwIfAborted()
+    const jobs = new IndexJobs()
+    readers.add(jobs)
+    try { return await jobs.run<T>(kind, payload, signal) }
+    finally { await jobs.close(); readers.delete(jobs) }
+  }
 
   // ── 常驻记账（Part A）：~/.dsh/project-index/savings.jsonl ──
   const savingsFile = join(cacheDir, 'savings.jsonl')
@@ -107,16 +130,13 @@ export function apply(ctx: AppContext, config: Config): void {
   /** 统一计量包装（不要在每个工具里重复）：savingsEnabled:false 时 ledger=null，零开销直通 */
   const measured = (
     toolName: string,
-    execute: (args: any) => any,
+    execute: (args: any, exec?: ToolRunContext) => any,
     naiveBytes: (args: any, result: any) => number,
   ) => wrapMeasured(toolName, execute, {
     ledger,
     naiveBytes,
-    rootOf: (args: any, result: any) => {
-      const r = (args && typeof args.root === 'string' && args.root) ||
-        (result && typeof result.root === 'string' ? result.root : '')
-      return r || '(default)'
-    },
+    rootOf: (args: any, result: any) => accountingRoot(args, result),
+    normalizeArgs: (args: any) => effectiveArgs(toolName, args),
   })
   /** imports 的朴素基线：out/in=被查文件字节数；hotspots/orphans=结果 items 各文件字节数之和（不触发 ensure，直接查已有 indexer） */
   const naiveFileBytes = (args: any, result: any): number => {
@@ -185,23 +205,55 @@ export function apply(ctx: AppContext, config: Config): void {
     }
   }
 
-  function indexerFor(rootArg?: string): ProjectIndexer {
+  function rootOf(rootArg?: string): string {
+    lifetime.signal.throwIfAborted()
     const root = rootArg ? cwdAbs(rootArg) : defaultRoot
     if (!root) throw new Error('未配置 rootDir 且未传 root 参数；请在插件设置里填 rootDir 或每次传 root')
-    let idx = indexers.get(root)
-    if (!idx) {
-      idx = new ProjectIndexer(root, cacheDir, opts)
-      indexers.set(root, idx)
-    }
-    idx.ensure()
-    return idx
+    return root
   }
 
-  /** Part D：status 专用——取/建 indexer 但不自动 ensure（refresh:true 才 heal），
-   *  与工具描述一致（"refresh 为 true 强制做一次自愈扫描"），避免每次 status 都追加 heal 行 */
+  function accountingRoot(args: any, result?: any): string {
+    const value = typeof args?.root === 'string' && args.root
+      ? args.root : typeof result?.root === 'string' && result.root ? result.root : defaultRoot
+    return value ? cwdAbs(value) : '(unconfigured)'
+  }
+
+  function pageLimit(value: unknown): number {
+    const limit = value ?? config.maxHits
+    if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error('limit 必须为正安全整数；maxHits 是缺省数量，显式 limit 可以更大')
+    }
+    return limit
+  }
+
+  function effectiveArgs(tool: string, args: any): unknown {
+    const root = accountingRoot(args)
+    const file = (p: unknown) => typeof p === 'string' && p
+      ? resolve(root === '(unconfigured)' ? '.' : root, p) : p
+    const limit = args.limit ?? config.maxHits
+    switch (tool) {
+      case 'project_symbols_find': return { root, name: args.name, kind: args.kind || undefined,
+        limit, ranking: args.ranking === true,
+        boostFiles: args.ranking === true ? (args.boostFiles ?? []).map(file) : [] }
+      case 'project_imports': return { root, file: ['hotspots', 'orphans'].includes(args.direction)
+        ? undefined : file(args.file), direction: args.direction ?? 'in', limit }
+      case 'project_json_read': return { root, path: file(args.path), limit: args.limit ?? Math.min(config.maxHits, 1000), cursor: args.cursor || undefined }
+      case 'project_slice_read': {
+        const mode = args.mode ?? 'window'
+        const find = mode === 'tail' ? undefined : args.find || undefined
+        return { root, path: file(args.path), mode, lengthBytes: args.lengthBytes ?? config.sliceBytes,
+          startBytes: mode === 'tail' || find ? undefined : args.startBytes ?? 0,
+          find, findFrom: find ? args.findFrom ?? 0 : undefined,
+          contextBefore: find ? args.contextBefore ?? 256 : undefined, re: find ? args.re === true : undefined,
+          searchMaxBytes: find ? args.searchMaxBytes ?? (args.re ? 16 * 1024 * 1024 : 64 * 1024 * 1024) : undefined,
+          searchBudgetMs: find ? args.searchBudgetMs ?? 1000 : undefined }
+      }
+      default: return { ...args, root }
+    }
+  }
+
   function indexerLazy(rootArg?: string): ProjectIndexer {
-    const root = rootArg ? cwdAbs(rootArg) : defaultRoot
-    if (!root) throw new Error('未配置 rootDir 且未传 root 参数；请在插件设置里填 rootDir 或每次传 root')
+    const root = rootOf(rootArg)
     let idx = indexers.get(root)
     if (!idx) {
       idx = new ProjectIndexer(root, cacheDir, opts)
@@ -210,7 +262,15 @@ export function apply(ctx: AppContext, config: Config): void {
     return idx
   }
 
-  const rel = (idx: ProjectIndexer, abs: string): string => {
+  /** Queries reconcile the current tree before returning; no implicit stale shortcut. */
+  async function indexerFor(rootArg?: string, exec?: ToolRunContext): Promise<ProjectIndexer> {
+    const idx = indexerLazy(rootArg)
+    const report = await idx.ensure(callSignal(exec))
+    if (report.failedFiles > 0) throw new Error(`索引核验未完成（${report.failedFiles} 个文件失败）；请重试或使用 project_index_status 查看 scanErrors`)
+    return idx
+  }
+
+  const rel = (idx: { root: string }, abs: string): string => {
     const r = relative(idx.root, abs)
     return r && !r.startsWith('..') && !isAbsolute(r) ? r.replace(/\\/g, '/') : abs
   }
@@ -234,6 +294,12 @@ export function apply(ctx: AppContext, config: Config): void {
           symbols: { type: 'integer' },
           imports: { type: 'integer' },
           updatedAt: { type: 'integer' },
+          verifiedAt: { type: 'integer' },
+          pendingFiles: { type: 'integer' },
+          failedFiles: { type: 'integer' },
+          scanErrors: { type: 'array', items: { type: 'string' } },
+          cacheWriteError: { type: 'string' },
+          cacheInvalidReason: { type: 'string' },
           scannedBytes: { type: 'integer' },
           rescannedFiles: { type: 'integer' },
           addedFiles: { type: 'integer' },
@@ -276,9 +342,11 @@ export function apply(ctx: AppContext, config: Config): void {
         const s = v as any
         const lines: string[] = [
           `[index] root=${s.root}`,
-          `files=${s.files} symbols=${s.symbols} imports=${s.imports} updatedAt=${s.updatedAt}`,
+          `files=${s.files} symbols=${s.symbols} imports=${s.imports} updatedAt=${s.updatedAt} verifiedAt=${s.verifiedAt}`,
           s.scannedBytes !== undefined ? `lastHeal: scannedBytes=${s.scannedBytes} rescanned=${s.rescannedFiles} added=${s.addedFiles} dropped=${s.droppedFiles}` : '',
-          `consistency=${s.consistency} staleMs=${s.staleMs} cacheCorrupt=${s.cacheCorruptCount}`,
+          `consistency=${s.consistency} staleMs=${s.staleMs} cacheCorrupt=${s.cacheCorruptCount} pendingFiles=${s.pendingFiles}`,
+          s.cacheWriteError ? `cacheWriteError=${s.cacheWriteError}` : '',
+          s.failedFiles ? `scanErrors=${JSON.stringify(s.scanErrors)}` : '',
         ]
         const t = s.trend ?? {}
         if (t.windowCount > 0) lines.push(`trend(±${t.windowCount}行): scannedΔ=${t.scannedBytesDelta} rescannedΔ=${t.rescannedFilesDelta} addedΔ=${t.addedDelta} droppedΔ=${t.droppedDelta}`)
@@ -292,12 +360,12 @@ export function apply(ctx: AppContext, config: Config): void {
         return text(lines.filter(Boolean).join('\n'))
       },
     },
-    execute: async (args) => {
+    execute: async (args, exec) => {
       const idx = indexerLazy(args.root)
       // 首次状态查询自动建索引（升级前 status 经 indexerFor 隐式 ensure；lazy 化后必须保住
       // 这个语义，否则全新 root 上 status 返回全零 + staleMs=纪元毫秒）；此后不带 refresh
       // 不再隐式扫描（避免每次 status 追加 heal 行）。refresh:true 时无论怎样都强制 heal。
-      if (args.refresh || idx.lastReport === null) idx.ensure()
+      if (args.refresh || idx.lastReport === null) await idx.ensure(callSignal(exec))
       const rep = idx.lastReport
       const hist = idx.readHistory(idx.root, Math.max(1, Math.floor(args.history ?? 10)))
       return {
@@ -306,13 +374,19 @@ export function apply(ctx: AppContext, config: Config): void {
         symbols: idx.status.symbols,
         imports: idx.status.imports,
         updatedAt: idx.status.updatedAt,
+        verifiedAt: idx.status.verifiedAt,
+        pendingFiles: idx.status.pendingFiles,
+        failedFiles: rep?.failedFiles ?? 0,
+        scanErrors: rep?.scanErrors ?? [],
+        cacheWriteError: idx.status.cacheWriteError,
+        cacheInvalidReason: idx.status.cacheInvalidReason,
         scannedBytes: rep?.scannedBytes ?? 0,
         rescannedFiles: rep?.rescannedFiles ?? 0,
         addedFiles: rep?.addedFiles ?? 0,
         droppedFiles: rep?.droppedFiles ?? 0,
-        consistency: 'reconcile_working_tree',
-        // updatedAt=0（从未 heal）时给出 0 而非 Date.now()-0 的天文数字
-        staleMs: idx.status.updatedAt === 0 ? 0 : Math.max(0, Date.now() - idx.status.updatedAt),
+        consistency: idx.status.pendingFiles > 0 || (rep?.failedFiles ?? 0) > 0 ? 'partial_reconcile' : 'reconcile_working_tree',
+        // 未成功核验时返回 0；verifiedAt=0 与 partial_reconcile 明确标记未核验状态
+        staleMs: idx.status.verifiedAt === 0 ? 0 : Math.max(0, Date.now() - idx.status.verifiedAt),
         cacheCorruptCount: idx.cacheCorruptCount,
         historyCorruptLines: hist.corruptLines,
         trend: idx.historyTrend(hist.rows),
@@ -333,12 +407,12 @@ export function apply(ctx: AppContext, config: Config): void {
   /* ────────── 工具 2：符号查找（指针式，超量落盘） ────────── */
   const toolSymbols = defineTool({
     name: 'project_symbols_find',
-    description: '在增量索引里按名字/子串查找函数、类、常量等符号，返回 相对路径+行号+短上下文 指针（不整文件喂给模型）。命中超 maxHits 的部分写入 spill 文件并返回其路径。ranking=true 时按“匹配度优先 + 所在文件 PageRank 降序”排序（并列排序键，不改变命中集合）。',
+    description: '在增量索引里按名字/子串查找函数、类、常量等符号，返回 相对路径+行号+短上下文 指针（不整文件喂给模型）。maxHits 是缺省返回数量，超出本次 limit 的部分写入 spill 文件并返回其路径。ranking=true 时按“匹配度优先 + 所在文件 PageRank 降序”排序（并列排序键，不改变命中集合）。',
     parameters: {
       root: { type: 'string', description: '项目根目录' },
       name: { type: 'string', description: '符号名或子串', required: true },
       kind: { type: 'string', description: '过滤 kind：function/class/const/type/interface/func/fn' },
-      limit: { type: 'integer', description: '内联返回上限，缺省用 maxHits' },
+      limit: { type: 'integer', description: '正整数；缺省 maxHits（默认数量），显式 limit 可大于 maxHits；余项 spill' },
       ranking: { type: 'boolean', description: '为 true 时按匹配度(完整名>前缀>子串)优先、组内按所在文件 PageRank 降序排列；缺省 false 保持旧 file+line 顺序（输出与升级前一致）' },
       boostFiles: { type: 'array', items: { type: 'string' }, description: '（进阶，仅 ranking=true 生效）会话中已提及/正在编辑的文件路径集合，命中这些文件的符号排名提前（aider repomap「mentioned files」思路，只改排序不改命中集合）' },
     },
@@ -378,11 +452,11 @@ export function apply(ctx: AppContext, config: Config): void {
         return text(lines.join('\n'))
       },
     },
-    execute: measured('project_symbols_find', async (args) => {
-      const idx = indexerFor(args.root)
+    execute: measured('project_symbols_find', async (args, exec) => {
+      const idx = await indexerFor(args.root, exec)
       const boost = Array.isArray(args.boostFiles) ? args.boostFiles.filter((x: unknown): x is string => typeof x === 'string') : undefined
       const { hits, matchedFileBytes } = idx.findSymbols(args.name, args.kind, args.ranking === true, boost)
-      const limit = Math.max(1, Math.floor(args.limit ?? config.maxHits))
+      const limit = pageLimit(args.limit)
       const kept = hits.slice(0, limit)
       let spillPath = ''
       let spillCount = 0
@@ -415,7 +489,7 @@ export function apply(ctx: AppContext, config: Config): void {
       root: { type: 'string', description: '项目根目录' },
       file: { type: 'string', description: '相对 root 的路径（direction=out/in 时必填；hotspots/orphans 忽略）' },
       direction: { type: 'string', enum: ['out', 'in', 'hotspots', 'orphans'], description: 'out=该文件引用了谁；in=谁引用了该文件；hotspots=被引用 top-k；orphans=孤立文件' },
-      limit: { type: 'integer', description: '内联上限（hotspots 即 top-k）' },
+      limit: { type: 'integer', description: '正整数；缺省 maxHits，显式 limit 可更大；余项 spill（hotspots 即 top-k）' },
     },
     output: {
       schema: {
@@ -437,6 +511,9 @@ export function apply(ctx: AppContext, config: Config): void {
               properties: {
                 from: { type: 'string' },
                 to: { type: 'string' },
+                specifier: { type: 'string' },
+                status: { type: 'string' },
+                target: { type: 'string' },
                 line: { type: 'integer' },
                 context: { type: 'string' },
               },
@@ -466,15 +543,15 @@ export function apply(ctx: AppContext, config: Config): void {
           return text(lines.join('\n'))
         }
         const lines: string[] = [`[imports ${v.direction}] ${v.file} → ${v.total} 条`]
-        for (const e of v.edges ?? []) lines.push(` ${e.from}:${e.line} → ${e.to} — ${e.context}`)
+        for (const e of v.edges ?? []) lines.push(` ${e.from}:${e.line} → ${e.to} [${e.status}; specifier=${JSON.stringify(e.specifier)}] — ${e.context}`)
         if (v.spillPath) lines.push(` [spill] 其余 ${v.spillCount} 条见 ${v.spillPath}`)
         return text(lines.join('\n'))
       },
     },
-    execute: measured('project_imports', async (args) => {
-      const idx = indexerFor(args.root)
+    execute: measured('project_imports', async (args, exec) => {
+      const idx = await indexerFor(args.root, exec)
       const dir = args.direction ?? 'in'
-      const limit = Math.max(1, Math.floor(args.limit ?? config.maxHits))
+      const limit = pageLimit(args.limit)
       if (dir === 'hotspots' || dir === 'orphans') {
         const rows = dir === 'hotspots' ? idx.findHotspots() : idx.findOrphans()
         const kept = rows.slice(0, limit)
@@ -517,7 +594,8 @@ export function apply(ctx: AppContext, config: Config): void {
         returned: kept.length,
         spillPath,
         spillCount,
-        edges: kept.map((e) => ({ from: e.from, to: e.to, line: e.line, context: e.context })),
+        edges: kept.map((e) => ({ from: e.from, to: e.to, specifier: e.specifier, status: e.status,
+          ...(e.target ? { target: e.target } : {}), line: e.line, context: e.context })),
       }
     }, (_args, _r) => naiveFileBytes(_args, _r)),
   })
@@ -529,7 +607,7 @@ export function apply(ctx: AppContext, config: Config): void {
     parameters: {
       root: { type: 'string', description: '项目根目录' },
       pattern: { type: 'string', description: '相对路径子串过滤（大小写不敏感）' },
-      limit: { type: 'integer', description: '内联上限' },
+      limit: { type: 'integer', description: '正整数；缺省 maxHits，显式 limit 可更大；余项 spill' },
     },
     output: {
       schema: {
@@ -559,10 +637,10 @@ export function apply(ctx: AppContext, config: Config): void {
         return text(lines.join('\n'))
       },
     },
-    execute: async (args) => {
-      const idx = indexerFor(args.root)
+    execute: async (args, exec) => {
+      const idx = await indexerFor(args.root, exec)
       const list = idx.listFiles(args.pattern)
-      const limit = Math.max(1, Math.floor(args.limit ?? config.maxHits))
+      const limit = pageLimit(args.limit)
       const kept = list.slice(0, limit)
       let spillPath = ''
       let spillCount = 0
@@ -585,74 +663,59 @@ export function apply(ctx: AppContext, config: Config): void {
     },
   })
 
-  /* ────────── 工具 5：byte 指针切片（单行超大文件兜底；Part C：tail/正则） ────────── */
+  /* ────────── 工具 5：UTF-8 byte 指针切片 ────────── */
   const toolSlice = defineTool({
     name: 'project_slice_read',
-    description: '按字节窗口精确读取文件的一段（不整读文件），返回 字节偏移+snippet+next 指针，可配合 find=字符串 直接定位到内容处。mode=tail 从文件尾部读窗口（日志场景，带 tailOffset）；re=true 时 find 按正则（默认字面量子串不变）。对单行超大文件/日志最合适（行号读取会失效）。',
+    description: '读取 UTF-8 文件半开字节窗口，lengthBytes 是实际返回字节数，nextByteOffset 指向下一页。必要时扩展到完整字符边界并报告调整；tail 读尾部。find 默认不区分大小写字面量，re=true 在单个可终止 Worker 的连续有界窗口匹配。预算耗尽明确标记搜索未完成。',
     parameters: {
-      root: { type: 'string', description: '项目根目录' },
+      root: { type: 'string', description: '项目根目录，缺省 rootDir' },
       path: { type: 'string', description: '相对 root 或绝对路径', required: true },
-      startBytes: { type: 'integer', description: '起始字节偏移（find 存在时会被覆盖为命中点-contextBefore；mode=tail 时忽略）' },
-      lengthBytes: { type: 'integer', description: '窗口字节数，缺省 sliceBytes' },
-      find: { type: 'string', description: '可选：先定位该子串再切片（默认大小写不敏感字面量；re=true 时为正则）' },
-      findFrom: { type: 'integer', description: 'find 搜索起始字节偏移，配合 nextByteOffset 翻页' },
-      contextBefore: { type: 'integer', description: 'find 命中时往前带多少字节上下文，缺省 256' },
-      mode: { type: 'string', enum: ['window', 'tail'], description: 'window=按 startBytes/find 定位（默认）；tail=从文件尾部读 lengthBytes 窗口（日志场景，find 不适用）' },
-      re: { type: 'boolean', description: 'find 按正则（大小写不敏感）。默认 false 字面量子串（行为不变）；re:true 需 find.length≤256，正则在独立线程执行并有界中断（默认 250ms，超时抛 slice_find_regex_timeout），ReDoS 不会阻塞主线程' },
+      startBytes: { type: 'integer', description: '普通内容分页起始字节，缺省0；find 命中或 tail 模式覆盖' },
+      lengthBytes: { type: 'integer', description: '请求窗口正整数1..16MiB，缺省 sliceBytes；实际范围可能因字符边界调整' },
+      find: { type: 'string', description: '先搜索再切片；默认字面量不区分大小写，最多65536字符；re=true 最多256字符' },
+      findFrom: { type: 'integer', description: '再次搜索的起始字节；普通翻页用 startBytes' },
+      contextBefore: { type: 'integer', description: '命中前上下文字节0..16MiB，缺省256' },
+      mode: { type: 'string', enum: ['window', 'tail'], description: '缺省window；tail从尾部取窗口并忽略find' },
+      re: { type: 'boolean', description: '正则只在单个有界连续窗口执行，预算耗尽后无可靠跳过点时须提高预算重试' },
+      searchMaxBytes: { type: 'integer', description: '搜索字节预算1..64MiB；缺省字面量64MiB、正则16MiB' },
+      searchBudgetMs: { type: 'integer', description: '含启动和读取的整体时间预算1..10000ms；缺省1000ms，超时等待Worker终止' },
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: true,
-        properties: {
-          path: { type: 'string' },
-          byteOffset: { type: 'integer' },
-          lengthBytes: { type: 'integer' },
-          totalBytes: { type: 'integer' },
-          nextByteOffset: { type: 'integer' },
-          hitByteOffset: { type: 'integer' },
-          tailOffset: { type: 'integer' },
-          snippet: { type: 'string' },
-          mayTruncate: { type: 'boolean' },
-        },
-      },
+      schema: { type: 'object', additionalProperties: true, properties: {
+        root: { type: 'string' }, path: { type: 'string' }, byteOffset: { type: 'integer' },
+        lengthBytes: { type: 'integer' }, totalBytes: { type: 'integer' }, nextByteOffset: { type: 'integer' },
+        hitByteOffset: { type: 'integer' }, tailOffset: { type: 'integer' }, snippet: { type: 'string' },
+        mayTruncate: { type: 'boolean' }, rangeAdjusted: { type: 'boolean' },
+        requestedStartBytes: { type: 'integer' }, requestedLengthBytes: { type: 'integer' },
+        searchStatus: { type: 'string' }, searchComplete: { type: 'boolean' }, scannedBytes: { type: 'integer' },
+        nextFindFrom: { type: 'integer' }, searchDiagnostic: { type: 'string' },
+        searchScope: { type: 'string' }, searchByteStart: { type: 'integer' }, searchByteEnd: { type: 'integer' },
+      } },
       render: (args, v) => {
-        const bo = v.byteOffset ?? 0
-        const ln = v.lengthBytes ?? 0
-        const head = [
-          `[slice] ${v.path}`,
-          `bytes ${bo}..${bo + ln} / total ${v.totalBytes ?? 0} (next=${v.nextByteOffset ?? 0})${v.mayTruncate ? ' [mayTruncate]' : ''}`,
-        ]
-        // 只在确实执行了 find 且有命中时才显示 find@byte（tail/无 find 时 hitByteOffset 为 0 占位，不该显示）
-        if (args.find && v.hitByteOffset !== undefined && v.hitByteOffset > 0) head.push(`find@byte=${v.hitByteOffset}`)
-        return text(head.join('\n') + '\n---\n' + (v.snippet ?? '') + '\n---\n' +
-          `继续下一页：project_slice_read path=${v.path} findFrom=${v.nextByteOffset ?? 0} lengthBytes=${ln || config.sliceBytes}`)
+        const vv = v as any
+        const lines = [`[slice] ${vv.path}`,
+          `bytes [${vv.byteOffset},${vv.nextByteOffset}) / total ${vv.totalBytes}; lengthBytes=${vv.lengthBytes}${vv.rangeAdjusted ? ' [UTF-8 range adjusted]' : ''}`]
+        if (vv.hitByteOffset !== undefined) lines.push(`find@byte=${vv.hitByteOffset}`)
+        if (vv.searchStatus !== 'not_requested') lines.push(`search=${vv.searchStatus} complete=${vv.searchComplete} scannedBytes=${vv.scannedBytes}`)
+        if (vv.searchDiagnostic) lines.push(vv.searchDiagnostic)
+        if (vv.searchScope !== 'none') lines.push(`scope=${vv.searchScope} bytes [${vv.searchByteStart},${vv.searchByteEnd})`)
+        lines.push('---', vv.snippet, '---')
+        if (vv.mayTruncate) lines.push('继续下一页：project_slice_read ' + JSON.stringify({ root: vv.root, path: vv.path,
+          startBytes: vv.nextByteOffset, lengthBytes: vv.requestedLengthBytes }))
+        if (args.find && vv.nextFindFrom !== undefined) lines.push('继续搜索：project_slice_read ' + JSON.stringify({ root: vv.root, path: vv.path,
+          find: args.find, re: args.re ?? false, findFrom: vv.nextFindFrom, lengthBytes: vv.requestedLengthBytes,
+          contextBefore: args.contextBefore ?? 256, searchMaxBytes: args.searchMaxBytes ?? (args.re ? 16 * 1024 * 1024 : 64 * 1024 * 1024), searchBudgetMs: args.searchBudgetMs ?? 1000 }))
+        return text(lines.join('\n'))
       },
     },
-    execute: measured('project_slice_read', async (args) => {
-      const idx = indexerFor(args.root)
-      const abs = isAbsolute(args.path) ? resolve(args.path) : resolve(idx.root, args.path)
-      const r = await sliceRead(abs, {
-        startBytes: args.startBytes,
-        lengthBytes: args.lengthBytes ?? config.sliceBytes,
-        find: args.find || undefined,
-        findFrom: args.findFrom || undefined,
-        contextBefore: args.contextBefore ?? 256,
-        mode: args.mode,
-        re: args.re === true ? true : undefined,
-      })
-      const out: any = {
-        path: rel(idx, abs),
-        byteOffset: r.byteOffset,
-        lengthBytes: r.lengthBytes,
-        totalBytes: r.totalBytes,
-        nextByteOffset: r.nextByteOffset,
-        hitByteOffset: r.hitByteOffset ?? 0,
-        snippet: r.snippet,
-        mayTruncate: r.mayTruncate,
-      }
-      if (r.tailOffset !== undefined) out.tailOffset = r.tailOffset
-      return out
+    execute: measured('project_slice_read', async (args, exec) => {
+      const root = rootOf(args.root)
+      const abs = isAbsolute(args.path) ? resolve(args.path) : resolve(root, args.path)
+      const r = await trackedRead(sliceRead(abs, { startBytes: args.startBytes,
+        lengthBytes: args.lengthBytes ?? config.sliceBytes, find: args.find || undefined, findFrom: args.findFrom,
+        contextBefore: args.contextBefore ?? 256, mode: args.mode, re: args.re,
+        searchMaxBytes: args.searchMaxBytes, searchBudgetMs: args.searchBudgetMs }, callSignal(exec)))
+      return { ...r, root, path: rel({ root }, abs) }
     }, (_args, r) => r?.totalBytes ?? 0),
   })
 
@@ -694,8 +757,8 @@ export function apply(ctx: AppContext, config: Config): void {
         `note: ${v.note}`,
       ].join('\n')),
     },
-    execute: async (args) => {
-      const idx = indexerFor(args.root)
+    execute: async (args, exec) => {
+      const idx = await indexerFor(args.root, exec)
       let outputChars = 0
       let naiveBytes = 0
       let hits = 0
@@ -738,10 +801,10 @@ export function apply(ctx: AppContext, config: Config): void {
   /* ────────── 工具 7：常驻记账查询（Part A） ────────── */
   const toolSavings = defineTool({
     name: 'project_savings',
-    description: '常驻记账查询：累计每次 project_symbols_find / project_imports / project_slice_read 调用“朴素整文件读取 vs 指针输出”的节省（chars/naiveBytes/savedTokens）。可按 root / 工具过滤，返回累计聚合、按工具/按 root 分组与最近 N 次记录；超量落盘。token 开销极低（顺序读 savings.jsonl）。口径注意：savedTokens 是相对「命中文件整读」基线的估算上界（≈bytes/4），非真实计费差；重复查询（dupCalls）的节省未去重。',
+    description: '常驻记账查询：累计每次 project_symbols_find / project_imports / project_slice_read / project_json_read 调用“朴素整文件读取 vs 指针输出”的节省（chars/naiveBytes/savedTokens）。可按 root / 工具过滤，返回累计聚合、按工具/按 root 分组与最近 N 次记录；超量落盘。token 开销极低（顺序读 savings.jsonl）。口径注意：savedTokens 是相对「命中文件整读」基线的估算上界（≈bytes/4），非真实计费差；重复查询（dupCalls）的节省未去重。',
     parameters: {
       root: { type: 'string', description: '按 root（绝对路径）过滤；缺省不过滤' },
-      tool: { type: 'string', enum: ['project_symbols_find', 'project_imports', 'project_slice_read'], description: '按工具过滤；缺省不过滤' },
+      tool: { type: 'string', enum: ['project_symbols_find', 'project_imports', 'project_slice_read', 'project_json_read'], description: '按工具过滤；缺省不过滤' },
       limit: { type: 'integer', description: '内联返回的最近记录数，缺省 maxHits；超量部分落盘 spill' },
     },
     output: {
@@ -816,18 +879,18 @@ export function apply(ctx: AppContext, config: Config): void {
           const rows = vv.recent ?? []
           if (rows.length) {
             lines.push('  recent (newest first):')
-            for (const r of [...rows].reverse().slice(0, 8)) lines.push(`   ${new Date(r.ts).toISOString().slice(11, 19)} ${r.tool} saved≈${r.savedTokens}t (${r.chars}c vs ${r.naiveBytes}B)${r.failed ? ' [failed]' : ''}`)
+            for (const r of [...rows].reverse()) lines.push(`   ${new Date(r.ts).toISOString().slice(11, 19)} ${r.tool} saved≈${r.savedTokens}t (${r.chars}c vs ${r.naiveBytes}B)${r.failed ? ' [failed]' : ''}`)
           }
           if (vv.spillPath) lines.push(` [spill] 其余 ${vv.spillCount} 条见 ${vv.spillPath}`)
         }
         return text(lines.join('\n'))
       },
     },
-    execute: async (args) => {
+    execute: async (args, exec) => {
       if (!ledger) {
         return { enabled: false, note: 'savingsEnabled=false，记账未开启；置 true 后需重载插件' }
       }
-      const q = ledger.query({ root: args.root, tool: args.tool, recent: Math.max(1, Math.floor(args.limit ?? config.maxHits)), cacheDir })
+      const q = ledger.query({ root: args.root ? rootOf(args.root) : undefined, tool: args.tool, recent: pageLimit(args.limit), cacheDir })
       const out: any = {
         enabled: true,
         totalRows: q.totalRows,
@@ -847,94 +910,55 @@ export function apply(ctx: AppContext, config: Config): void {
     },
   })
 
-  /* ────────── 工具 8：有界 JSON 分页（Part C） ────────── */
+  /* ────────── 工具 8：有界 JSON cursor 分页 ────────── */
   const toolJson = defineTool({
     name: 'project_json_read',
-    description: '有界 JSON 顶层键分页：流式扫描（不整体解析，超大/超深 JSON 不 OOM）顶层 {...} 的 key，返回 key + byteStart/byteEnd + ≤240 字符值摘要，可配合 project_slice_read 用 byteStart/byteEnd 回跳精读。仅对 .json（或大单行结构）文件有优势；超量落盘。只读文件。',
+    description: '按 cursor 有界读取 JSON 顶层对象键；下一页从完成项边界继续，每项返回 UTF-8 半开字节范围和值摘要。只扫描当前页，完整计数前 totalKeys 未知、整文件校验未完成。默认数量 maxHits（最多1000），单页扫描16MiB/2s、输出64KiB、键4096字节、深度128；超预算有明确诊断，可用字节指针精读。',
     parameters: {
-      root: { type: 'string', description: '项目根目录' },
-      path: { type: 'string', description: '相对 root 或绝对路径（JSON 文件）', required: true },
-      limit: { type: 'integer', description: '内联返回的顶层键数，缺省 maxHits；超出部分落盘 spill' },
+      root: { type: 'string', description: '项目根目录，缺省 rootDir' },
+      path: { type: 'string', description: '相对 root 或绝对 JSON 文件路径', required: true },
+      limit: { type: 'integer', description: '每页正整数，缺省 min(maxHits,1000)；硬上限1000；其余项用 cursor 访问' },
+      cursor: { type: 'string', description: '上页 nextCursor；绑定文件、扫描器和插件生命周期，文件变化或插件重新加载后须从第一页重新开始' },
     },
     output: {
       schema: {
-        type: 'object',
-        additionalProperties: true,
+        type: 'object', additionalProperties: true,
         properties: {
-          root: { type: 'string' },
-          path: { type: 'string' },
-          topLevel: { type: 'string' },
-          error: { type: 'string' },
-          totalKeys: { type: 'integer' },
-          returned: { type: 'integer' },
-          entries: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: true,
-              properties: {
-                key: { type: 'string' },
-                byteStart: { type: 'integer' },
-                byteEnd: { type: 'integer' },
-                preview: { type: 'string' },
-              },
-            },
-          },
-          spillPath: { type: 'string' },
-          spillCount: { type: 'integer' },
-          topPreview: { type: 'string' },
+          root: { type: 'string' }, path: { type: 'string' }, topLevel: { type: 'string' },
+          error: { type: 'string' }, topPreview: { type: 'string' },
+          totalKeys: { type: 'integer' }, totalKeysKnown: { type: 'boolean' }, returned: { type: 'integer' },
+          hasMore: { type: 'boolean' }, nextCursor: { type: 'string' }, scannedBytes: { type: 'integer' },
+          scanStartByte: { type: 'integer' }, scanEndByte: { type: 'integer' }, validation: { type: 'string' },
+          elapsedMs: { type: 'number' }, valueByteStart: { type: 'integer' }, readBytes: { type: 'integer' },
+          diagnosticCode: { type: 'string' }, resumeByteOffset: { type: 'integer' },
+          entries: { type: 'array', items: { type: 'object', additionalProperties: true, properties: {
+            key: { type: 'string' }, byteStart: { type: 'integer' }, byteEnd: { type: 'integer' }, preview: { type: 'string' },
+          } } },
         },
       },
-      render: (args, v) => {
+      render: (_args, v) => {
         const vv = v as any
-        const lines: string[] = [`[json] ${vv.path} topLevel=${vv.topLevel} keys=${vv.totalKeys}${vv.error ? ' error=' + vv.error : ''}`]
-        if (vv.entries) {
-          for (const e of vv.entries.slice(0, 12)) lines.push(` ${e.key} @${e.byteStart}..${e.byteEnd} — ${e.preview.slice(0, 80)}`)
-          if (vv.entries.length > 12) lines.push(` … 共 ${vv.entries.length} 条；byte 指针可配 project_slice_read 回跳精读`)
-        }
-        if (vv.spillPath) lines.push(` [spill] 其余 ${vv.spillCount} 条见 ${vv.spillPath}`)
+        const lines = [`[json] ${vv.path} topLevel=${vv.topLevel} returned=${vv.returned} totalKeys=${vv.totalKeysKnown ? vv.totalKeys : 'unknown'} validation=${vv.validation}`,
+          `scannedBytes=${vv.scannedBytes} bytes [${vv.scanStartByte},${vv.scanEndByte})`]
+        for (const e of vv.entries ?? []) lines.push(` ${JSON.stringify(e.key)} @[${e.byteStart},${e.byteEnd}) — ${e.preview}`)
+        if (vv.error) lines.push(`error=${vv.error}`)
+        if (vv.diagnosticCode) lines.push(`diagnostic=${vv.diagnosticCode}`)
+        if (vv.nextCursor) lines.push('继续下一页：project_json_read ' + JSON.stringify({ root: vv.root, path: vv.path, limit: _args.limit ?? Math.min(config.maxHits, 1000), cursor: vv.nextCursor }))
+        if (vv.resumeByteOffset !== undefined) lines.push('精读定位：project_slice_read ' + JSON.stringify({ root: vv.root, path: vv.path, startBytes: vv.valueByteStart ?? vv.resumeByteOffset, lengthBytes: config.sliceBytes }))
+        if ((vv.entries ?? []).length) lines.push('byte 范围为 UTF-8 半开区间；project_slice_read 使用 root/path/startBytes=byteStart/lengthBytes=byteEnd-byteStart 精读')
         return text(lines.join('\n'))
       },
     },
-    execute: measured('project_json_read', async (args) => {
-      const idx = indexerFor(args.root)
-      const abs = isAbsolute(args.path) ? resolve(args.path) : resolve(idx.root, args.path)
-      const scan = scanJsonKeys(abs, { maxPreview: 240 })
-      const limit = Math.max(1, Math.floor(args.limit ?? config.maxHits))
-      const kept = scan.entries.slice(0, limit)
-      let spillPath = ''
-      let spillCount = 0
-      if (scan.entries.length > limit) {
-        const sp = idx.writeSpill(scan.entries.slice(limit), cacheDir, 'json')
-        if (sp) {
-          spillPath = sp.path
-          spillCount = scan.entries.length - limit
-        }
-      }
-      const out: any = {
-        root: idx.root,
-        path: rel(idx, abs),
-        topLevel: scan.topLevel,
-        totalKeys: scan.totalKeys,
-        returned: kept.length,
-        entries: kept,
-      }
-      if (scan.error) out.error = scan.error
-      if (scan.topPreview) out.topPreview = scan.topPreview
-      if (spillPath) {
-        out.spillPath = spillPath
-        out.spillCount = spillCount
-      }
-      return out
+    execute: measured('project_json_read', async (args, exec) => {
+      const root = rootOf(args.root)
+      if (Buffer.byteLength(root, 'utf8') > 1024) throw new Error('JSON root 超过1024 UTF-8字节的输出路径预算')
+      const abs = isAbsolute(args.path) ? resolve(args.path) : resolve(root, args.path)
+      const limit = args.limit === undefined ? Math.min(config.maxHits, 1000) : pageLimit(args.limit)
+      if (limit > 1000) throw new Error('JSON limit 硬上限1000；请使用 nextCursor 分页读取剩余结果')
+      const scan = await readJob<JsonScanResult>('json', { path: abs, opts: { limit, cursor: args.cursor, maxPreview: 240, cursorSecret } }, exec)
+      return { ...scan, root, path: rel({ root }, abs), returned: scan.entries.length }
     }, (args) => {
-      // 朴素基线 = 整个 JSON 文件字节数（常驻记账）
-      try {
-        const root = args?.root ? cwdAbs(args.root) : defaultRoot
-        const idx2 = indexers.get(root)
-        return idx2 ? statSync(idx2.resolveFile(args.path)).size : 0
-      } catch {
-        return 0
-      }
+      try { return statSync(resolve(rootOf(args.root), args.path)).size } catch { return 0 }
     }),
   })
 
@@ -948,41 +972,51 @@ export function apply(ctx: AppContext, config: Config): void {
 
   // 后台自愈：Node 全局定时器（不依赖 timer 服务，unref 不阻进程退出）。
   // apply 一次只产生一个 timer（本 apply 闭包内唯一）。
-  const daemonTimer = setInterval(() => {
-    // 迭代中删除 Map 条目在 JS 里是安全的，但仍先收集再删（稳妥，避免未来重构踩坑）
-    const vanished: string[] = []
-    for (const [root, idx] of indexers) {
-      try {
-        // root 已消失则不必再让 ensure 抛错：existsSync 预判直接摘除（Map key 与 idx.root
-        // 同为 cwdAbs 归一值），err.message 含「root 不存在」时兜底摘除
-        if (!existsSync(root)) {
-          vanished.push(root)
-          continue
+  let daemonRunning = false
+  const daemonTimer = setInterval(async () => {
+    if (daemonRunning || lifetime.signal.aborted) return
+    daemonRunning = true
+    try {
+      // 收集并清理消失的根目录；每个刷新完成后再继续下一项。
+      const vanished: string[] = []
+      for (const [root, idx] of indexers) {
+        try {
+          if (!existsSync(root)) {
+            vanished.push(root)
+            continue
+          }
+          const rep = await idx.ensure(lifetime.signal)
+          if (lifetime.signal.aborted) return
+          log(`heal root=${root} files=${rep.totalFiles} scanned=${rep.scannedBytes}B rescanned=${rep.rescannedFiles} added=${rep.addedFiles} dropped=${rep.droppedFiles} symbols=${rep.symbols} imports=${rep.imports}`)
+        } catch (e) {
+          if (lifetime.signal.aborted) return
+          const msg = e instanceof Error ? e.message : String(e)
+          if (msg.includes('root 不存在')) {
+            vanished.push(root)
+            continue
+          }
+          log(`heal failed root=${root}: ${msg.slice(0, 200)}`)
         }
-        const rep = idx.ensure()
-        log(`heal root=${root} files=${rep.totalFiles} scanned=${rep.scannedBytes}B rescanned=${rep.rescannedFiles} added=${rep.addedFiles} dropped=${rep.droppedFiles} symbols=${rep.symbols} imports=${rep.imports}`)
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e)
-        if (msg.includes('root 不存在')) {
-          // 目录已消失：从 Map 摘除实例，终止每 5 分钟一条的 heal failed 刷屏
-          vanished.push(root)
-          continue
-        }
-        log(`heal failed root=${root}: ${msg.slice(0, 200)}`)
       }
-    }
-    for (const root of vanished) {
-      indexers.delete(root)
-      log(`drop root=${root}（目录已消失）`)
-    }
+      for (const root of vanished) {
+        await indexers.get(root)?.dispose()
+        indexers.delete(root)
+        log(`drop root=${root}（目录已消失）`)
+      }
+    } finally { daemonRunning = false }
   }, config.intervalMs)
   if (typeof daemonTimer === 'object' && daemonTimer !== null && 'unref' in daemonTimer) {
     daemonTimer.unref?.()
   }
   // 定时器清理绑定同一生命周期：dispose 时 clearInterval（session-index 同款
   // ctx.effect(() => () => {...}) 返回清理函数范式），reload 不产生重复定时任务。
-  ctx.effect(() => () => {
+  ctx.effect(() => async () => {
     clearInterval(daemonTimer as NodeJS.Timeout)
+    lifetime.abort(new Error('plugin disposed'))
+    await Promise.all([...indexers.values()].map((idx) => idx.dispose()))
+    await Promise.all([...readers].map((jobs) => jobs.close()))
+    await Promise.allSettled([...directReads])
+    indexers.clear()
   }, `${name}: daemon cleanup`)
 
   log(`plugin ready; defaultRoot=${defaultRoot || '(未配置，需传 root)'} cacheDir=${cacheDir} rootHashSample=${defaultRoot ? rootHash(defaultRoot) : '-'}`)
